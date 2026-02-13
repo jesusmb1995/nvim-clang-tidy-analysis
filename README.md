@@ -42,6 +42,7 @@ return {
   - **Location:** same file, line, column, and message;
   - **Content:** same message plus normalized continuation lines (handles renames);
   - **Message only:** same warning message text (e.g. same diagnostic in another file).
+- **Diff “changed lines” filter:** When diffing, the plugin can restrict the diff to warnings that lie on **lines changed** between the current commit and the upstream branch (e.g. `upstream/main`). If your branch has an upstream set (e.g. `branch.main.merge`), that ref is used by default; otherwise you can pass it as the 4th argument. Uses `git diff upstream_ref...HEAD` to get changed line ranges and keeps only warnings whose (file, line) falls in those ranges.
 - **Progress:** If [fidget.nvim](https://github.com/j-hui/fidget.nvim) is loaded, background generate tasks report progress from clang-tidy stdout (e.g. `[2/3] Processing file …`, `N warnings generated`).
 
 ## Commands
@@ -54,11 +55,11 @@ return {
 
 ### Diff logs
 
-- **`:ClangTidyDiff [old_log] [new_log] [out_path]`**  
+- **`:ClangTidyDiff [old_log] [new_log] [out_path] [upstream_ref]`**  
   Show only warnings that appear in the new log but not in the old log (after deduplication).  
   Writes the result to `clang_tidy.diff.log` (or `out_path`) and opens it in the quickfix list.  
   **Defaults:** `old_log` = `clang_tidy.old.log`, `new_log` = `clang_tidy.new.log`, `out_path` = `clang_tidy.diff.log`.  
-  With no arguments, uses all three defaults.
+  **Changed-lines filter:** If **`upstream_ref`** is given (e.g. `upstream/main`), or if the current branch has an upstream (e.g. based on `upstream/main`), the diff is further restricted to warnings that lie on lines changed in `git diff upstream_ref...HEAD`. So you only see new warnings in code you actually changed since the upstream branch. Omit the 4th argument or leave it empty to use the branch’s upstream; pass a ref explicitly to override or to filter when no upstream is set.
 
 ### Generate logs (background)
 
@@ -93,11 +94,12 @@ return {
 :ClangTidyShowLog /path/to/clang_tidy.log
 
 " Diff with default files (clang_tidy.old.log vs clang_tidy.new.log → clang_tidy.diff.log)
+" If branch has upstream (e.g. upstream/main), only warnings on changed lines are shown
 :ClangTidyDiff
 
-" Diff with explicit paths
+" Diff with explicit paths; 4th arg = only warnings on lines changed since upstream/main
 :ClangTidyDiff /path/to/old.log /path/to/new.log
-:ClangTidyDiff old.log new.log /path/to/clang_tidy.diff.log
+:ClangTidyDiff old.log new.log /path/to/clang_tidy.diff.log upstream/main
 
 " Generate old and new logs (e.g. for directory 'addon')
 :ClangTidyGenerateOld addon

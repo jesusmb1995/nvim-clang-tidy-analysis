@@ -121,12 +121,103 @@ local function content_signature(w)
   return table.concat(parts, '\n')
 end
 
+--- Get changed line ranges (new file side) from git diff upstream_ref...HEAD.
+--- Returns (ranges_by_file, repo_root) or (nil, nil) on error. ranges_by_file[rel_path] = { {start=N, count=M}, ... }.
+--- @param upstream_ref string e.g. "upstream/main" or "origin/main"
+--- @param cwd string working directory (git repo root or subdir)
+--- @return table|nil ranges_by_file (key = path relative to repo root)
+--- @return string|nil repo_root
+local function get_changed_line_ranges(upstream_ref, cwd)
+  local repo_root = vim.fn.trim(vim.fn.system({ 'git', 'rev-parse', '--show-toplevel' }) or '')
+  if repo_root == '' or vim.v.shell_error ~= 0 then
+    return nil, nil
+  end
+  -- Three-dot: changes in HEAD since branch point from upstream_ref (e.g. upstream/main)
+  local diff_out = vim.fn.system({
+    'git',
+    'diff',
+    upstream_ref .. '...HEAD',
+    '--no-color',
+    '-U0',
+  })
+  if vim.v.shell_error ~= 0 then
+    return nil, nil
+  end
+  if not diff_out or diff_out == '' then
+    return {}, repo_root
+  end
+  local ranges_by_file = {}
+  local current_file_rel = nil
+  for line in (diff_out .. '\n'):gmatch('(.-)\n') do
+    local b_path = line:match('^diff %-%-git a/.+ b/(.+)$')
+    if b_path then
+      current_file_rel = b_path
+      if current_file_rel ~= '' then
+        ranges_by_file[current_file_rel] = ranges_by_file[current_file_rel] or {}
+      end
+    elseif current_file_rel and ranges_by_file[current_file_rel] then
+      local new_start, new_count = line:match('^@@ .- %+(%d+),?(%d*) @@')
+      if new_start then
+        new_start = tonumber(new_start)
+        new_count = (new_count == '' or new_count == '0') and 1 or tonumber(new_count)
+        if new_start and new_count and new_count > 0 then
+          table.insert(ranges_by_file[current_file_rel], { start = new_start, count = new_count })
+        end
+      end
+    end
+  end
+  return ranges_by_file, repo_root
+end
+
+--- Get current branch upstream ref (e.g. upstream/main or origin/main) if set; nil otherwise.
+local function get_default_upstream_ref()
+  local ref = vim.fn.trim(vim.fn.system({ 'git', 'rev-parse', '--abbrev-ref', '@{upstream}' }) or '')
+  if ref == '' or vim.v.shell_error ~= 0 then
+    return nil
+  end
+  return ref
+end
+
+--- Check if (filename_abs, line_num) falls inside any changed range. filename can be absolute; repo_root used to get relative path.
+local function is_line_in_changed_ranges(filename_abs, line_num, ranges_by_file, repo_root)
+  if not ranges_by_file or not repo_root or repo_root == '' then
+    return true
+  end
+  local path = filename_abs:gsub('\\', '/')
+  repo_root = repo_root:gsub('\\', '/'):gsub('/$', '')
+  local rel = path
+  if path:sub(1, #repo_root) == repo_root then
+    rel = path:sub(#repo_root + 2):gsub('^/', '')
+  end
+  local ranges = ranges_by_file[rel]
+  if not ranges then
+    -- Try with other path variants (e.g. rel might be packages/... from repo root)
+    for rel_key, _ in pairs(ranges_by_file) do
+      if rel:find(rel_key, 1, true) == 1 or rel_key:find(rel, 1, true) == 1 then
+        ranges = ranges_by_file[rel_key]
+        break
+      end
+    end
+  end
+  if not ranges then
+    return false
+  end
+  for _, r in ipairs(ranges) do
+    if line_num >= r.start and line_num < r.start + r.count then
+      return true
+    end
+  end
+  return false
+end
+
 --- Compute warnings in new_log that are not in old_log; write diff to out_path and show in quickfix.
 --- Duplicates are removed by key (file:line:col:message) and by content (message + lines below), so renamed files match.
+--- If upstream_ref is given, only warnings on lines changed since that ref (e.g. upstream/main) are kept.
 --- @param old_log string? path to baseline log (default: clang_tidy.old.log in cwd)
 --- @param new_log string? path to new log (default: clang_tidy.new.log in cwd)
 --- @param out_path string? path for diff output (default: clang_tidy.diff.log in cwd)
-function M.diff_logs(old_log, new_log, out_path)
+--- @param upstream_ref string? if set, filter to warnings only in lines changed since upstream_ref...HEAD (e.g. "upstream/main")
+function M.diff_logs(old_log, new_log, out_path, upstream_ref)
   local cwd = vim.fn.getcwd()
   old_log = (old_log and old_log ~= '') and vim.fn.fnamemodify(old_log, ':p') or (cwd .. '/clang_tidy.old.log')
   new_log = (new_log and new_log ~= '') and vim.fn.fnamemodify(new_log, ':p') or (cwd .. '/clang_tidy.new.log')
@@ -162,6 +253,26 @@ function M.diff_logs(old_log, new_log, out_path)
     if not seen_by_key and not seen_by_content and not seen_by_message then
       table.insert(diff_warnings, w)
     end
+  end
+
+  -- Optional: keep only warnings on lines changed since upstream (default: current branch's @{upstream}, e.g. upstream/main)
+  if not upstream_ref or upstream_ref == '' then
+    upstream_ref = get_default_upstream_ref()
+  end
+  local ranges_by_file, repo_root
+  if upstream_ref and upstream_ref ~= '' then
+    ranges_by_file, repo_root = get_changed_line_ranges(upstream_ref, cwd)
+    if not repo_root then
+      vim.notify('clang_tidy_analysis: not a git repo or invalid upstream ref "' .. upstream_ref .. '"', vim.log.levels.ERROR)
+      return
+    end
+    local filtered = {}
+    for _, w in ipairs(diff_warnings) do
+      if is_line_in_changed_ranges(w.filename, w.lnum, ranges_by_file, repo_root) then
+        table.insert(filtered, w)
+      end
+    end
+    diff_warnings = filtered
   end
 
   -- Write diff log
@@ -267,14 +378,15 @@ end, {
 vim.api.nvim_create_user_command('ClangTidyDiff', function(opts)
   local args = vim.split(opts.args, '%s+', { plain = true })
   -- 0 args: use clang_tidy.old.log and clang_tidy.new.log
-  -- 1–2 args: old_log, new_log; 3 args: old_log, new_log, out_path
+  -- 1–3: old_log, new_log, out_path; 4th: upstream_ref (only show warnings on lines changed since that ref, e.g. upstream/main)
   local old_log = args[1] and args[1] ~= '' and args[1] or nil
   local new_log = args[2] and args[2] ~= '' and args[2] or nil
   local out_path = args[3] and args[3] ~= '' and args[3] or nil
-  M.diff_logs(old_log, new_log, out_path)
+  local upstream_ref = args[4] and args[4] ~= '' and args[4] or nil
+  M.diff_logs(old_log, new_log, out_path, upstream_ref)
 end, {
   nargs = '*',
-  desc = 'Diff clang_tidy logs (default: clang_tidy.old.log vs clang_tidy.new.log); optional: <old_log> <new_log> [out_path]',
+  desc = 'Diff clang_tidy logs; optional 4th arg: upstream_ref (e.g. upstream/main) to keep only warnings on changed lines',
 })
 
 vim.api.nvim_create_user_command('ClangTidyGenerateOld', function(opts)
