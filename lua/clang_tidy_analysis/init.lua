@@ -134,16 +134,20 @@ function M.diff_logs(old_log, new_log, out_path)
 
   local old_keys = {}
   local old_content = {}
+  local old_messages = {}
   for _, w in ipairs(old_w) do
     old_keys[w.key] = true
     old_content[content_signature(w)] = true
+    old_messages[w.message:match('^%s*(.-)%s*$')] = true
   end
 
   local diff_warnings = {}
   for _, w in ipairs(new_w) do
+    local msg_norm = w.message:match('^%s*(.-)%s*$')
     local seen_by_key = old_keys[w.key]
     local seen_by_content = old_content[content_signature(w)]
-    if not seen_by_key and not seen_by_content then
+    local seen_by_message = old_messages[msg_norm]
+    if not seen_by_key and not seen_by_content and not seen_by_message then
       table.insert(diff_warnings, w)
     end
   end
