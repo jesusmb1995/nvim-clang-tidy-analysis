@@ -96,13 +96,14 @@ function M.show_log(log_path)
 end
 
 --- Compute warnings in new_log that are not in old_log; write diff to out_path and show in quickfix.
---- @param old_log string path to baseline log
---- @param new_log string path to new log
---- @param out_path string path for diff output (default: clang_tidy.diff.log in cwd)
+--- @param old_log string? path to baseline log (default: clang_tidy.old.log in cwd)
+--- @param new_log string? path to new log (default: clang_tidy.new.log in cwd)
+--- @param out_path string? path for diff output (default: clang_tidy.diff.log in cwd)
 function M.diff_logs(old_log, new_log, out_path)
-  old_log = vim.fn.fnamemodify(old_log, ':p')
-  new_log = vim.fn.fnamemodify(new_log, ':p')
-  out_path = out_path or (vim.fn.getcwd() .. '/clang_tidy.diff.log')
+  local cwd = vim.fn.getcwd()
+  old_log = (old_log and old_log ~= '') and vim.fn.fnamemodify(old_log, ':p') or (cwd .. '/clang_tidy.old.log')
+  new_log = (new_log and new_log ~= '') and vim.fn.fnamemodify(new_log, ':p') or (cwd .. '/clang_tidy.new.log')
+  out_path = out_path or (cwd .. '/clang_tidy.diff.log')
   out_path = vim.fn.fnamemodify(out_path, ':p')
 
   local old_w, err_old = M.parse_log(old_log)
@@ -150,6 +151,39 @@ function M.diff_logs(old_log, new_log, out_path)
   )
 end
 
+--- Run clang-tidy on all *.cpp under folder and tee output to clang_tidy.old.log or clang_tidy.new.log.
+--- @param folder string directory to search (e.g. addon)
+--- @param which string "old" or "new" -> clang_tidy.old.log or clang_tidy.new.log
+--- @param build_dir string compile_commands dir (default: build)
+--- @param config_file string path to .clang-tidy (default: .clang-tidy in cwd)
+function M.generate(folder, which, build_dir, config_file)
+  local cwd = vim.fn.getcwd()
+  which = (which == 'old' or which == 'new') and which or 'new'
+  build_dir = (build_dir and build_dir ~= '') and build_dir or 'build'
+  config_file = (config_file and config_file ~= '') and config_file or '.clang-tidy'
+  local out_log = cwd .. '/clang_tidy.' .. which .. '.log'
+  -- Shell: clang-tidy --config-file=.clang-tidy -p build $(find folder -name '*.cpp') | tee out_log
+  local cmd = string.format(
+    "clang-tidy --config-file=%s -p %s $(find %s -name '*.cpp') 2>&1 | tee %s",
+    vim.fn.shellescape(config_file),
+    vim.fn.shellescape(build_dir),
+    vim.fn.shellescape(folder),
+    vim.fn.shellescape(out_log)
+  )
+  vim.notify(('clang_tidy_analysis: running clang-tidy on %s -> %s'):format(folder, out_log), vim.log.levels.INFO)
+  vim.fn.jobstart(cmd, {
+    cwd = cwd,
+    shell = true,
+    on_exit = function(_, code)
+      if code == 0 then
+        vim.notify(('clang_tidy_analysis: wrote %s'):format(out_log), vim.log.levels.INFO)
+      else
+        vim.notify(('clang_tidy_analysis: command exited with %s (output still written to %s)'):format(code, out_log), vim.log.levels.WARN)
+      end
+    end,
+  })
+end
+
 -- User commands
 vim.api.nvim_create_user_command('ClangTidyShowLog', function(opts)
   local path = opts.args
@@ -164,15 +198,39 @@ end, {
 
 vim.api.nvim_create_user_command('ClangTidyDiff', function(opts)
   local args = vim.split(opts.args, '%s+', { plain = true })
-  if #args < 2 then
-    vim.notify('ClangTidyDiff: usage :ClangTidyDiff <old_log> <new_log> [out_path]', vim.log.levels.ERROR)
+  -- 0 args: use clang_tidy.old.log and clang_tidy.new.log
+  -- 1–2 args: old_log, new_log; 3 args: old_log, new_log, out_path
+  local old_log = args[1] and args[1] ~= '' and args[1] or nil
+  local new_log = args[2] and args[2] ~= '' and args[2] or nil
+  local out_path = args[3] and args[3] ~= '' and args[3] or nil
+  M.diff_logs(old_log, new_log, out_path)
+end, {
+  nargs = '*',
+  desc = 'Diff clang_tidy logs (default: clang_tidy.old.log vs clang_tidy.new.log); optional: <old_log> <new_log> [out_path]',
+})
+
+vim.api.nvim_create_user_command('ClangTidyGenerateOld', function(opts)
+  local folder = opts.args:match('^%s*(.-)%s*$')
+  if folder == '' then
+    vim.notify('ClangTidyGenerateOld: usage :ClangTidyGenerateOld <folder> (e.g. addon)', vim.log.levels.ERROR)
     return
   end
-  local out_path = args[3] and args[3] ~= '' and args[3] or nil
-  M.diff_logs(args[1], args[2], out_path)
+  M.generate(folder, 'old')
 end, {
-  nargs = '+',
-  desc = 'Diff two clang_tidy logs; show new warnings in quickfix and write to clang_tidy.diff.log (or third arg)',
+  nargs = 1,
+  desc = 'Run clang-tidy on folder (find folder -name "*.cpp") and write output to clang_tidy.old.log',
+})
+
+vim.api.nvim_create_user_command('ClangTidyGenerateNew', function(opts)
+  local folder = opts.args:match('^%s*(.-)%s*$')
+  if folder == '' then
+    vim.notify('ClangTidyGenerateNew: usage :ClangTidyGenerateNew <folder> (e.g. addon)', vim.log.levels.ERROR)
+    return
+  end
+  M.generate(folder, 'new')
+end, {
+  nargs = 1,
+  desc = 'Run clang-tidy on folder (find folder -name "*.cpp") and write output to clang_tidy.new.log',
 })
 
 return M
