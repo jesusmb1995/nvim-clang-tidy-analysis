@@ -4,6 +4,18 @@
 
 local M = {}
 
+local FIDGET_KEY = 'clang_tidy_analysis'
+
+--- Report task progress via fidget.nvim if available (optional dependency).
+local function fidget_notify(msg, level, opts)
+  opts = opts or {}
+  opts.key = opts.key or FIDGET_KEY
+  local ok, fidget = pcall(require, 'fidget')
+  if ok and fidget and fidget.notify then
+    fidget.notify(msg, level or vim.log.levels.INFO, opts)
+  end
+end
+
 -- Pattern: path:LINE:COL: warning: message [...]
 local WARNING_LINE_PATTERN = '^(.+):(%d+):(%d+): warning: (.+)$'
 
@@ -174,12 +186,18 @@ function M.diff_logs(old_log, new_log, out_path)
   )
 end
 
+-- Clang-tidy stdout: "[2/3] Processing file /path/to/file.cpp." and "145881 warnings generated."
+local CLANG_TIDY_PROGRESS_PATTERN = '^%[(%d+)/(%d+)%]%s+Processing file%s+(.-)%.?%s*$'
+local CLANG_TIDY_SUMMARY_PATTERN = '^(%d+)%s+warning[s]?%s+generated%.%s*$'
+
 --- Run clang-tidy on all *.cpp under folder and tee output to clang_tidy.old.log or clang_tidy.new.log.
+--- Reports progress via fidget.nvim from "[N/M] Processing file ..." and "N warnings generated." in log output.
 --- @param folder string directory to search (e.g. addon)
 --- @param which string "old" or "new" -> clang_tidy.old.log or clang_tidy.new.log
---- @param build_dir string compile_commands dir (default: build)
---- @param config_file string path to .clang-tidy (default: .clang-tidy in cwd)
-function M.generate(folder, which, build_dir, config_file)
+--- @param build_dir string|nil compile_commands dir (default: build)
+--- @param config_file string|nil path to .clang-tidy (default: .clang-tidy in cwd)
+--- @param on_done function|nil callback(job_exit_code) when job exits
+function M.generate(folder, which, build_dir, config_file, on_done)
   local cwd = vim.fn.getcwd()
   which = (which == 'old' or which == 'new') and which or 'new'
   build_dir = (build_dir and build_dir ~= '') and build_dir or 'build'
@@ -193,15 +211,42 @@ function M.generate(folder, which, build_dir, config_file)
     vim.fn.shellescape(folder),
     vim.fn.shellescape(out_log)
   )
+  local task_label = ('clang-tidy %s (%s)'):format(which, folder)
+  local fidget_key = FIDGET_KEY .. '_' .. which .. '_' .. folder:gsub('[^%w]', '_')
+  local function update_fidget(msg, annote)
+    fidget_notify(msg, vim.log.levels.INFO, { key = fidget_key, annote = annote or 'running…' })
+  end
+  update_fidget(task_label, 'running…')
   vim.notify(('clang_tidy_analysis: running clang-tidy on %s -> %s'):format(folder, out_log), vim.log.levels.INFO)
   vim.fn.jobstart(cmd, {
     cwd = cwd,
     shell = true,
+    on_stdout = function(_, data, _)
+      if not data then return end
+      for _, line in ipairs(data) do
+        line = type(line) == 'string' and line or ''
+        local cur, total, file = line:match(CLANG_TIDY_PROGRESS_PATTERN)
+        if cur and total and file then
+          local short = file:match('([^/]+)$') or file
+          update_fidget(('[%s/%s] %s'):format(cur, total, short), ('Processing %s'):format(short))
+        else
+          local n = line:match(CLANG_TIDY_SUMMARY_PATTERN)
+          if n then
+            update_fidget(('%s [%s/%s]'):format(task_label, n, n), ('%s warnings generated'):format(n))
+          end
+        end
+      end
+    end,
     on_exit = function(_, code)
       if code == 0 then
+        fidget_notify(task_label, vim.log.levels.INFO, { key = fidget_key, annote = 'done' })
         vim.notify(('clang_tidy_analysis: wrote %s'):format(out_log), vim.log.levels.INFO)
       else
+        fidget_notify(task_label, vim.log.levels.WARN, { key = fidget_key, annote = ('exit %s'):format(code) })
         vim.notify(('clang_tidy_analysis: command exited with %s (output still written to %s)'):format(code, out_log), vim.log.levels.WARN)
+      end
+      if type(on_done) == 'function' then
+        on_done(code)
       end
     end,
   })
@@ -254,6 +299,104 @@ vim.api.nvim_create_user_command('ClangTidyGenerateNew', function(opts)
 end, {
   nargs = 1,
   desc = 'Run clang-tidy on folder (find folder -name "*.cpp") and write output to clang_tidy.new.log',
+})
+
+--- Generate new log then run diff (uses existing clang_tidy.old.log).
+vim.api.nvim_create_user_command('ClangTidyGenerateNewDiff', function(opts)
+  local folder = opts.args:match('^%s*(.-)%s*$')
+  if folder == '' then
+    vim.notify('ClangTidyGenerateNewDiff: usage :ClangTidyGenerateNewDiff <folder> (e.g. addon)', vim.log.levels.ERROR)
+    return
+  end
+  fidget_notify('ClangTidyGenerateNewDiff: generating new then diff…', vim.log.levels.INFO, { annote = 'running…' })
+  M.generate(folder, 'new', nil, nil, function()
+    M.diff_logs(nil, nil, nil)
+    fidget_notify('ClangTidyGenerateNewDiff: done', vim.log.levels.INFO, { annote = 'done' })
+  end)
+end, {
+  nargs = 1,
+  desc = 'Run ClangTidyGenerateNew <folder> then ClangTidyDiff (needs clang_tidy.old.log already)',
+})
+
+--- Run generate-diff: optionally checkout branch and generate old, then generate new and diff.
+--- If branch is not given, opens vim.ui.select to pick a branch.
+local function run_generate_diff(folder, branch)
+  local cwd = vim.fn.getcwd()
+  local prev_branch = vim.fn.trim(vim.fn.system({ 'git', 'rev-parse', '--abbrev-ref', 'HEAD' }) or '')
+  if prev_branch == '' or vim.v.shell_error ~= 0 then
+    vim.notify('ClangTidyGenerateDiff: not in a git repo or could not get current branch', vim.log.levels.ERROR)
+    return
+  end
+  local function do_checkout_then_old(branch_to_use)
+    branch_to_use = branch_to_use or branch
+    if not branch_to_use or branch_to_use == '' then return end
+    fidget_notify(('ClangTidyGenerateDiff: checkout %s…'):format(branch_to_use), vim.log.levels.INFO, { annote = 'running…' })
+    vim.fn.jobstart({ 'git', 'checkout', branch_to_use }, {
+      cwd = cwd,
+      on_exit = function(_, checkout_code)
+        if checkout_code ~= 0 then
+          fidget_notify(('ClangTidyGenerateDiff: git checkout %s failed'):format(branch_to_use), vim.log.levels.ERROR, { annote = 'failed' })
+          vim.notify(('ClangTidyGenerateDiff: git checkout %s failed'):format(branch_to_use), vim.log.levels.ERROR)
+          return
+        end
+        M.generate(folder, 'old', nil, nil, function()
+          vim.fn.jobstart({ 'git', 'checkout', prev_branch }, {
+            cwd = cwd,
+            on_exit = function(_, back_code)
+              if back_code ~= 0 then
+                fidget_notify('ClangTidyGenerateDiff: git checkout back failed', vim.log.levels.ERROR, { annote = 'failed' })
+                vim.notify('ClangTidyGenerateDiff: failed to checkout back to ' .. prev_branch, vim.log.levels.ERROR)
+                return
+              end
+              M.generate(folder, 'new', nil, nil, function()
+                M.diff_logs(nil, nil, nil)
+                fidget_notify('ClangTidyGenerateDiff: done', vim.log.levels.INFO, { annote = 'done' })
+              end)
+            end,
+          })
+        end)
+      end,
+    })
+  end
+  if branch and branch ~= '' then
+    do_checkout_then_old(branch)
+    return
+  end
+  local raw = vim.fn.system({ 'git', 'for-each-ref', '--format=%(refname:short)', 'refs/heads/' })
+  if not raw or raw == '' or vim.v.shell_error ~= 0 then
+    vim.notify('ClangTidyGenerateDiff: could not list branches', vim.log.levels.ERROR)
+    return
+  end
+  local branches = {}
+  for line in (raw:gmatch('[^\r\n]+')) do
+    line = line:match('^%s*(.-)%s*$')
+    if line ~= '' then table.insert(branches, line) end
+  end
+  if #branches == 0 then
+    vim.notify('ClangTidyGenerateDiff: no branches found', vim.log.levels.ERROR)
+    return
+  end
+  vim.ui.select(branches, {
+    prompt = 'Select branch for old log (baseline):',
+    format_item = function(item) return item end,
+  }, function(choice)
+    if not choice or choice == '' then return end
+    do_checkout_then_old()
+  end)
+end
+
+vim.api.nvim_create_user_command('ClangTidyGenerateDiff', function(opts)
+  local args = vim.split(opts.args, '%s+', { plain = true })
+  if #args < 1 or args[1] == '' then
+    vim.notify('ClangTidyGenerateDiff: usage :ClangTidyGenerateDiff <folder> [branch] (e.g. addon or addon main)', vim.log.levels.ERROR)
+    return
+  end
+  local folder = args[1]
+  local branch = (args[2] and args[2] ~= '') and args[2] or nil
+  run_generate_diff(folder, branch)
+end, {
+  nargs = '*',
+  desc = 'Generate old on <branch> (or pick from GUI), then new on current branch and diff. Usage: <folder> [branch]',
 })
 
 return M
