@@ -245,14 +245,45 @@ function M.diff_logs(old_log, new_log, out_path, upstream_ref)
   end
 
   local diff_warnings = {}
+  local debug_log = os.getenv('CLANG_TIDY_ANALYSIS_DEBUG') == '1'
+  local stats = { by_key = 0, by_content = 0, by_message = 0, kept = 0 }
+  --- For debug: short path (basename or rel) and truncated message.
+  local function debug_label(w)
+    local path = w.filename:gsub('\\', '/')
+    local short_path = path:match('([^/]+)$') or path
+    if #short_path > 40 then short_path = '...' .. short_path:sub(-37) end
+    local msg_short = (w.message:match('^%s*(.-)%s*$') or w.message):sub(1, 52)
+    if #msg_short >= 52 then msg_short = msg_short .. '...' end
+    return ('%s:%d'):format(short_path, w.lnum), msg_short
+  end
   for _, w in ipairs(new_w) do
     local msg_norm = w.message:match('^%s*(.-)%s*$')
     local seen_by_key = old_keys[w.key]
     local seen_by_content = old_content[content_signature(w)]
     local seen_by_message = old_messages[msg_norm]
-    if not seen_by_key and not seen_by_content and not seen_by_message then
+    local decision
+    if seen_by_key then
+      stats.by_key = stats.by_key + 1
+      decision = 'excluded:by_key'
+    elseif seen_by_content then
+      stats.by_content = stats.by_content + 1
+      decision = 'excluded:by_content'
+    elseif seen_by_message then
+      stats.by_message = stats.by_message + 1
+      decision = 'excluded:by_message'
+    else
+      stats.kept = stats.kept + 1
+      decision = 'kept'
       table.insert(diff_warnings, w)
     end
+    if debug_log then
+      local loc, msg_short = debug_label(w)
+      io.stderr:write(('[clang_tidy_analysis] %s | %s | %s\n'):format(loc, decision, msg_short))
+    end
+  end
+  if debug_log then
+    io.stderr:write(('[clang_tidy_analysis] --- summary: old=%d new=%d -> kept=%d (excluded: by_key=%d by_content=%d by_message=%d)\n')
+      :format(#old_w, #new_w, stats.kept, stats.by_key, stats.by_content, stats.by_message))
   end
 
   -- Optional: keep only warnings on lines changed since upstream (default: current branch's @{upstream}, e.g. upstream/main)
@@ -268,11 +299,21 @@ function M.diff_logs(old_log, new_log, out_path, upstream_ref)
     end
     local filtered = {}
     for _, w in ipairs(diff_warnings) do
-      if is_line_in_changed_ranges(w.filename, w.lnum, ranges_by_file, repo_root) then
+      local in_range = is_line_in_changed_ranges(w.filename, w.lnum, ranges_by_file, repo_root)
+      if debug_log then
+        local loc, msg_short = debug_label(w)
+        io.stderr:write(('[clang_tidy_analysis] %s | %s | %s\n')
+          :format(loc, in_range and 'in_changed_lines' or 'dropped:not_in_changed_lines', msg_short))
+      end
+      if in_range then
         table.insert(filtered, w)
       end
     end
     diff_warnings = filtered
+    if debug_log then
+      io.stderr:write(('[clang_tidy_analysis] --- after changed-lines filter (ref=%s): %d kept\n')
+        :format(upstream_ref or '', #diff_warnings))
+    end
   end
 
   -- Write diff log
@@ -314,12 +355,13 @@ function M.generate(folder, which, build_dir, config_file, on_done)
   build_dir = (build_dir and build_dir ~= '') and build_dir or 'build'
   config_file = (config_file and config_file ~= '') and config_file or '.clang-tidy'
   local out_log = cwd .. '/clang_tidy.' .. which .. '.log'
-  -- Shell: clang-tidy --config-file=.clang-tidy -p build $(find folder -name '*.cpp') | tee out_log
+  -- Shell: clang-tidy on *.cpp, *.hpp, *.h so headers (e.g. naming in .hpp) are analyzed too.
+  local find_exts = "find %s \\( -name '*.c*' -o -name '*.h*' \\)"
   local cmd = string.format(
-    "clang-tidy --config-file=%s -p %s $(find %s -name '*.cpp') 2>&1 | tee %s",
+    "clang-tidy --config-file=%s -p %s $(%s) 2>&1 | tee %s",
     vim.fn.shellescape(config_file),
     vim.fn.shellescape(build_dir),
-    vim.fn.shellescape(folder),
+    find_exts:format(vim.fn.shellescape(folder)),
     vim.fn.shellescape(out_log)
   )
   local task_label = ('clang-tidy %s (%s)'):format(which, folder)
