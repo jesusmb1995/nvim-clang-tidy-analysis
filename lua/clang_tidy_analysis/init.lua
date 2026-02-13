@@ -95,7 +95,22 @@ function M.show_log(log_path)
   end
 end
 
+--- Normalize a line from raw_lines for content comparison (strip path:line:col and line-number | prefix).
+local function normalize_content_line(line)
+  return (line:gsub('^[^:]*:%d+:%d*:?%s*', ''):gsub('^%s*%d+%s*|%s*', ''):gsub('^%s+', ''):gsub('%s+$', ''))
+end
+
+--- Content signature for a warning: message + normalized continuation lines (so same warning in renamed file matches).
+local function content_signature(w)
+  local parts = { w.message:match('^%s*(.-)%s*$') }
+  for i = 2, #w.raw_lines do
+    parts[i] = normalize_content_line(w.raw_lines[i])
+  end
+  return table.concat(parts, '\n')
+end
+
 --- Compute warnings in new_log that are not in old_log; write diff to out_path and show in quickfix.
+--- Duplicates are removed by key (file:line:col:message) and by content (message + lines below), so renamed files match.
 --- @param old_log string? path to baseline log (default: clang_tidy.old.log in cwd)
 --- @param new_log string? path to new log (default: clang_tidy.new.log in cwd)
 --- @param out_path string? path for diff output (default: clang_tidy.diff.log in cwd)
@@ -118,13 +133,17 @@ function M.diff_logs(old_log, new_log, out_path)
   end
 
   local old_keys = {}
+  local old_content = {}
   for _, w in ipairs(old_w) do
     old_keys[w.key] = true
+    old_content[content_signature(w)] = true
   end
 
   local diff_warnings = {}
   for _, w in ipairs(new_w) do
-    if not old_keys[w.key] then
+    local seen_by_key = old_keys[w.key]
+    local seen_by_content = old_content[content_signature(w)]
+    if not seen_by_key and not seen_by_content then
       table.insert(diff_warnings, w)
     end
   end
