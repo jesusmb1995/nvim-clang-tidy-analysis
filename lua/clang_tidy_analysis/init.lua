@@ -433,10 +433,7 @@ end, {
 
 vim.api.nvim_create_user_command('ClangTidyGenerateOld', function(opts)
   local folder = opts.args:match('^%s*(.-)%s*$')
-  if folder == '' then
-    vim.notify('ClangTidyGenerateOld: usage :ClangTidyGenerateOld <folder> (e.g. addon)', vim.log.levels.ERROR)
-    return
-  end
+  if folder == '' then folder = '.' end
   M.generate(folder, 'old')
 end, {
   nargs = '?',
@@ -445,10 +442,7 @@ end, {
 
 vim.api.nvim_create_user_command('ClangTidyGenerateNew', function(opts)
   local folder = opts.args:match('^%s*(.-)%s*$')
-  if folder == '' then
-    vim.notify('ClangTidyGenerateNew: usage :ClangTidyGenerateNew <folder> (e.g. addon)', vim.log.levels.ERROR)
-    return
-  end
+  if folder == '' then folder = '.' end
   M.generate(folder, 'new')
 end, {
   nargs = '?',
@@ -458,10 +452,7 @@ end, {
 --- Generate new log then run diff (uses existing clang_tidy.old.log).
 vim.api.nvim_create_user_command('ClangTidyGenerateNewDiff', function(opts)
   local folder = opts.args:match('^%s*(.-)%s*$')
-  if folder == '' then
-    vim.notify('ClangTidyGenerateNewDiff: usage :ClangTidyGenerateNewDiff <folder> (e.g. addon)', vim.log.levels.ERROR)
-    return
-  end
+  if folder == '' then folder = '.' end
   fidget_notify('ClangTidyGenerateNewDiff: generating new then diff…', vim.log.levels.INFO, { annote = 'running…' })
   M.generate(folder, 'new', nil, nil, function()
     M.diff_logs(nil, nil, nil)
