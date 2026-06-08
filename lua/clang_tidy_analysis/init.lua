@@ -439,7 +439,7 @@ vim.api.nvim_create_user_command('ClangTidyGenerateOld', function(opts)
   end
   M.generate(folder, 'old')
 end, {
-  nargs = 1,
+  nargs = '?',
   desc = 'Run clang-tidy on folder (find folder -name "*.cpp") and write output to clang_tidy.old.log',
 })
 
@@ -451,7 +451,7 @@ vim.api.nvim_create_user_command('ClangTidyGenerateNew', function(opts)
   end
   M.generate(folder, 'new')
 end, {
-  nargs = 1,
+  nargs = '?',
   desc = 'Run clang-tidy on folder (find folder -name "*.cpp") and write output to clang_tidy.new.log',
 })
 
@@ -468,7 +468,7 @@ vim.api.nvim_create_user_command('ClangTidyGenerateNewDiff', function(opts)
     fidget_notify('ClangTidyGenerateNewDiff: done', vim.log.levels.INFO, { annote = 'done' })
   end)
 end, {
-  nargs = 1,
+  nargs = '?',
   desc = 'Run ClangTidyGenerateNew <folder> then ClangTidyDiff (needs clang_tidy.old.log already)',
 })
 
